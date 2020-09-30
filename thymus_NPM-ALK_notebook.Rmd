@@ -1,0 +1,736 @@
+---
+title: "Deconvolution of thymus bulk data identifying T-cell proportions."
+author: "Crhistian Cardona"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+**Computational Epigenomics Research group:** [epi-logos.com](https://epi-logos.com/)
+
+# Context
+
+We use the [SCDC library](https://meichendong.github.io/SCDC/articles/SCDC.html) based on [MuSiC](https://xuranw.github.io/MuSiC/articles/MuSiC.html) to conduct the bulk RNA-seq data deconvolution with a sc-RNA-seq reference thymic dataset described in [A cell atlas of human thymic development defines T cell repertoire formation](https://doi.org/10.1126/science.aay3224) composed of 12 time points (age), 29 cell types, and 36,084 single-nucleus transcriptomes. In the following markdown file, we are going to show how we use the deconvolution library to calculate the cell type proportions of each replica in a thymus bulk dataset and finally, we will run a multiple differential expression analysis over a bulk data simulated and the actual bulk dataset to find the possible list of genes that the method is missing for the tumor replicas.
+
+Our paper: "Requeriment of DNMT1 to orchestrate epigenomic reprogramming during NPM-ALK driven T-cell lymphomagenesis" is published at [Life Science Alliance](https://doi.org/).
+
+# Data configuration  {.tabset}
+
+First, we have to install 2 libraries that have been modified in order to use sparse matrices in R: [Biobase](https://github.com/Bioconductor/Biobase) and [xbioc](https://github.com/renozao/xbioc). Then we imported a modified version of the library [SCDC](https://meichendong.github.io/SCDC/articles/SCDC.html) that has been modified to support: sparse matrices, parallelism, and Dynamic threshold for markers selection, among other improvements. Finally, we imported the general libraries required to run the complete pipeline.
+```{r importing_libraries, include=FALSE}
+if (!require("devtools")) {
+  install.packages("devtools")
+}
+
+#Check Biobase modified installation
+if("Biobase" %in% rownames(installed.packages())){
+  library(Biobase)
+}else{
+  devtools::install_github( repo = "crhisto/Biobase" , auth_token="8fa8c63fdadf5421370f0d0c6217ccff44eebf44")
+  library(Biobase)
+}
+
+#Check xbioc modified installation
+if("xbioc" %in% rownames(installed.packages())){
+  library(xbioc)
+}else{
+  devtools::install_github( repo = "crhisto/xbioc" , auth_token="8fa8c63fdadf5421370f0d0c6217ccff44eebf44")
+  library(xbioc)
+}
+
+#Check SCDC modified installation
+if("SCDC" %in% rownames(installed.packages())){
+  library(SCDC)
+}else{
+  devtools::install_github( repo = "crhisto/SCDC" , auth_token="8fa8c63fdadf5421370f0d0c6217ccff44eebf44")
+  library(SCDC)
+}
+
+
+#Check hdf5r installation
+if("hdf5r" %in% rownames(installed.packages())){
+  library(hdf5r)
+}else{
+  #install the package hdf5r
+  #Use the following command in ubuntu linux: sudo apt-get install libhdf5-dev
+  install.packages("hdf5r")
+  library(hdf5r)
+}
+
+
+#for deconvolution SCDC library
+library(pheatmap)
+library(foreach)
+library(doParallel)
+library(Seurat)
+library(fpc)
+library(tidyverse)
+library(fpc)
+library(stringr)
+library(dbscan)
+library(slam)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(DESeq2)
+library(BiocGenerics)
+library(Matrix)
+
+```
+
+The generic functions have been saved in the scripting file: scripts/generic_functions.R"
+```{r importing_script}
+source("scripts/generic_functions.R", local = knitr::knit_global())
+```
+
+We used the scRNA-seq data from the publication: [A cell atlas of human thymic development defines T cell repertoire formation](https://doi.org/10.1126/science.aay3224); the data is located in [https://zenodo.org](https://zenodo.org/record/3711134#.Xwcsd5MzY0o). We have to download both the single cell and the bulk dataset, the last one located in the folder [data](https://github.com/crhisto/thymus_NPM-ALK_notebook/data/eset.thymus.bulk.sparse.RData.zip) in the repository.
+```{bash download_scRNA_seq_bulk_RNA_seq, eval = FALSE}
+cd data
+
+#downloading the scRNA-seq dataset
+wget https://zenodo.org/record/3711134/files/thymus_annotated_matrix_files.zip
+unzip thymus_annotated_matrix_files.zip
+
+#downloading the bulk RNA-seq dataset
+#wget https://github.com/crhisto/thymus_NPM-ALK_notebook/data/eset.thymus.bulk.sparse.RData.zip
+#unzip eset.thymus.bulk.sparse.RData.zip
+```
+
+Importing of the bulk data with the 12 samples in a ESET object type supporting sparse matrices.
+```{r import_bulk_data_object}
+path.data <- paste0(getwd(), '/', 'data/')
+load(paste0(path.data, "eset.thymus.bulk.sparse.RData"))
+eset.thymus.bulk.sparse
+```
+
+Importing data for the single cell dataset and creation of the corresponding seurat objects for both: the complete set of time points and the last 3 time points ('4W','8W','24W').
+```{r creating_seural_scRNA_seq_data}
+path.data.sc <- paste0(path.data, "") 
+
+seurat_object.all <- ReadH5AD(paste0(path.data.sc, "HTA08.v02.A04.Science_mouse_total.h5ad"))
+
+# I get all the columns for all tisue samples for all experiments.
+annotations.all <- read.table(paste0(path.data.sc, "HTA08.v02.A04.Science_mouse_total.csv"), 
+                 header = TRUE,
+                 sep = ",")
+
+#I get the names of the cell types (clusters) to create the dataset
+paste(shQuote(sort(unique(annotations.all$cell.types))), collapse=", ")
+paste(shQuote(sort(unique(annotations.all$age))), collapse=", ")
+
+cluster_list.thymus <- data.frame(cell.types = c('aDC', 'B', 'CD4+T', 'CD8+T', 'cTEC', 'DC1', 'DC2', 'DN(P)', 'DN(Q)', 'DP(P)', 'DP(Q)', 'Endo', 'Epi_unknown', 'Ery', 'Fb', 'HSC', 'IELpA', 'IELpB/NKT', 'Mac', 'Mono', 'mTEC', 'NK', 'NMP', 'pDC', 'TEC_early', 'Treg', 'VSMC', 'αβT(entry)', 'γδT'), cluster_normalized = paste0('cluster_', 1:29), cluster_order = as.numeric(c(1:29)))
+
+#I add the cluster normalized for avoiding problems with names and special characters
+annotations.all <- annotations.all %>% inner_join(cluster_list.thymus, by = "cell.types")
+
+#I add the information from the annotations to the seurat object
+seurat_object.all@meta.data$index_cell_id <- annotations.all$index
+seurat_object.all@meta.data$cell_types_name <- annotations.all$cell.types
+seurat_object.all@meta.data$stage <- annotations.all$stage
+seurat_object.all@meta.data$age <- annotations.all$age
+seurat_object.all@meta.data$sample_id <- annotations.all$sample_id
+seurat_object.all@meta.data$cluster_normalized <- annotations.all$cluster_normalized
+
+#Assign the identity
+Idents(seurat_object.all) <- seurat_object.all$age
+
+seurat_object.all <- subset(seurat_object.all, idents = c('E12', 'E13', 'E14', 'E15', 'E16', 'E17', 'E18', 'P0', '4W','8W','24W'))
+
+#add filter of samples in the seurat object
+seurat_object.4w_8w_24w <- subset(seurat_object.all, idents = c('4W','8W','24W'))
+
+#create the count matrix base on the seurat object
+counts.thymus.4w_8w_24w <- create_count_matrix(seurat_object.4w_8w_24w)
+counts.thymus.all <- create_count_matrix(seurat_object.all)
+```
+
+
+## Deconvolution pipeline {.tabset}
+
+Creation of object with the scRNA-seq data for the deconvolution
+```{r create_eset_scrna_reference, echo = T, results = 'hide'}
+#Use the function to create the sparse eset object
+eset.sc.thymus.4.sparse <- create_sparse_eset_object(counts.thymus.4w_8w_24w, seurat_object.4w_8w_24w)
+head(eset.sc.thymus.4.sparse)
+
+eset.sc.thymus.4.sparse.all <- create_sparse_eset_object(counts.thymus.all, seurat_object.all)
+head(eset.sc.thymus.4.sparse.all)
+
+```
+
+Creation of object for simulate bulk RNA-seq data from the scRNA-seq data. 
+```{r object_simulation_bulk_scrna, echo = T, results = 'hide'}
+start_time <- Sys.time()
+pseudo.eset.sc.thymus.4.sparse <- generateBulk_allcells(eset = eset.sc.thymus.4.sparse, ct.varname = "cluster_normalized", sample = "age", ct.sub = NULL)
+end_time <- Sys.time()
+end_time - start_time
+
+start_time <- Sys.time()
+pseudo.eset.sc.thymus.4.sparse.all <- generateBulk_allcells(eset.sc.thymus.4.sparse.all, ct.varname = "cluster_normalized", sample = "age", ct.sub = NULL)
+end_time <- Sys.time()
+end_time - start_time
+
+```
+
+Using a hierarchical clustering, we can see with different parameters that in general there are 3 groups corresponding with the pseudotime shown in the paper [Park, J. et al. (21 Febrary 2020)](https://doi.org/10.1126/science.aay3224) Fig.2-G:
+Subcluster 1: DN (P), DN (Q): in this case, sometimes the two cell types appear in different clusters, however, we know that both are Double Negative cell types in different stages, hence, both are related.
+Subcluster 2: DP(P), DP(Q), αβT(entry)
+Subcluster 3: CD4+T, CD8+T
+Also, we use different clusters configurations, checking the final deviance and the Pearson Correlation.
+```{r hierarchical_clustering}
+cluster_list_pseudotime.sub <- paste0('cluster_', c(8,9,10,11,28,4,3))
+
+start_time <- Sys.time()
+
+basic.object <- SCDC_basis(x = eset.sc.thymus.4.sparse,
+                       ct.varname = "cluster_normalized", 
+                       sample = "age",
+                       ct.sub = cluster_list_pseudotime.sub)
+
+#Time of execution
+end_time <- Sys.time()
+end_time - start_time
+
+data.mvw <- basic.object$basis.mvw[, paste0('cluster_', c(8,9,10,11,28,4,3))]
+list_pseudotime <- c('DN(P)', 'DN(Q)', 'DP(P)', 'DP(Q)', 'αβT(entry)', 'CD8+T', 'CD4+T')
+colnames(data.mvw) <- list_pseudotime
+
+#clustering for deconvolution
+df.d <- dist(t(log(data.mvw + 1e-10)), method = "euclidean")
+hclust_single <- hclust(df.d, method = "single")
+
+cut_avg <- cutree(hclust_single, k =4)
+cut_avg
+
+plot(hclust_single, main = "log(basis matrix)")
+
+```
+
+### Deconvolution simulation {.tabset}
+
+Execution of the deconvolution with the simulated bulk database on the single-cell dataset. Given the Boostraping sampling, there is variability across different runs, however with a high boostrap.number, specifically in this case with 40, both the number of marker genes, the Pearson correlation, and the deviance have low variation. Be aware of the configuration of the machine that you are using for executing the deconvolution. In this case for each thread, you may need a maximum of 3 GB in RAM.
+```{r deconvolution_simulation}
+
+cluster_list_pseudotime.sub <- paste0('cluster_', c(8,9,10,11,28,4,3))
+cluster_list_pseudotime.fl.sub <- c("Subcluster 1", "Subcluster 2", "Subcluster 3")
+
+#add the metacluster information
+eset.sc.thymus.4.sparse.metacluster <- add_metacluster_pseudotime(eset.sc.thymus.4.sparse)
+
+start_time <- Sys.time()
+
+#run the tree guided process with subclusters
+deconvolution.simulation <- SCDC_prop_subcl_marker(bulk.eset = pseudo.eset.sc.thymus.4.sparse$pseudo_eset,
+                                                   sc.eset = eset.sc.thymus.4.sparse.metacluster,
+                                                   ct.varname = "cluster_normalized", fl.varname = "metacluster", sample = "age",
+                                                   ct.sub = cluster_list_pseudotime.sub,ct.fl.sub = cluster_list_pseudotime.fl.sub,
+                                                   truep = pseudo.eset.sc.thymus.4.sparse$truep, select.marker = TRUE,
+                                                   parallelize = T, core_number = 7,
+                                                   marker_gene_strategy = 'boostrap_outliers',
+                                                   iteration.minimun_number_markers = 28, iteration.use_maximum = TRUE, iteration.maximo_genes = 35,
+                                                   iteration.use_final_foldchange = TRUE,
+                                                   weight.basis = F, bootstrap.number = 40, bootstrap.sample_size = 4)
+
+deconvolution.simulation$prop.est
+
+deconvolution.simulation$peval$evals.table
+deconvolution.simulation$peval$pearson.sample.table
+
+#Time of execution: 60 min using 7 threads and approx. 17GB of RAM 
+end_time <- Sys.time()
+end_time - start_time
+```
+
+### Deconvolution of thymus bulk data {.tabset}
+
+Execution of the deconvolution with the actual bulk thymus data, using the optimized parameters found in the simulation.
+```{r deconvolution}
+
+#add the metacluster information
+eset.sc.thymus.4.sparse.metacluster <- add_metacluster_pseudotime(eset.sc.thymus.4.sparse)
+
+start_time <- Sys.time()
+
+deconvolution.real_data <- SCDC_prop_subcl_marker(bulk.eset = eset.thymus.bulk.sparse, sc.eset = eset.sc.thymus.4.sparse.metacluster,
+                                                  ct.varname = "cluster_normalized", fl.varname = "metacluster", sample = "age",
+                                                  ct.sub = cluster_list_pseudotime.sub, ct.fl.sub = cluster_list_pseudotime.fl.sub,
+                                                  select.marker = TRUE, parallelize = T, core_number = 7,
+                                                  marker_gene_strategy = 'boostrap_outliers',
+                                                  iteration.minimun_number_markers = 28, iteration.use_maximum = TRUE, iteration.maximo_genes = 35,
+                                                  iteration.use_final_foldchange = TRUE,
+                                                  weight.basis = F, bootstrap.number = 40, bootstrap.sample_size = 4)
+
+deconvolution.real_data$prop.est
+
+#Time of execution: 60 min using 7 threads and approx. 17GB of RAM 
+end_time <- Sys.time()
+end_time - start_time
+
+#Extraction of the marker genes
+markers.deconvolution.real_data <- rownames(deconvolution.real_data$basis.mvw)
+print(paste0('Number of marker genes: ', length(markers.deconvolution.real_data)))
+```
+
+## Result of the deconvolution
+
+Estimated proportions of the bulk data calculated for the deconvolution library for each replica/Sample.
+```{r plot_proportions}
+#proportions
+result <- deconvolution.real_data$prop.est
+
+#sorting the rows with samples
+result.sorted <- rbind(result[7:9,], result[4:6,], result[10:12,], result[1:3,])
+
+result.sorted <- order_result_generic(result.sorted, 1, 29)
+
+#get just the clusters that I need
+result.sorted <- result.sorted[, paste0('cluster_', c(8,9,10,11,28,4,3))]
+
+results_summarized <- cbind(result.sorted)
+colnames(results_summarized) <- list_pseudotime[1:7]
+
+thymus.result.summarized <- as.data.frame(t(results_summarized[]))
+thymus.result.summarized <- cbind(thymus.result.summarized, cluster_name = rownames(thymus.result.summarized))
+
+thymus.prop.summarized.melt <- melt(thymus.result.summarized, id.vars='cluster_name')
+thymus.prop.summarized.melt <- cbind(thymus.prop.summarized.melt, type = '', type_normalized = '', stringsAsFactors=FALSE)
+
+thymus.prop.summarized.melt <- within(thymus.prop.summarized.melt, type_normalized[str_sub(variable, 1, 6) == 'Thy_WT'] <- 'Ctrl')
+thymus.prop.summarized.melt <- within(thymus.prop.summarized.melt, type_normalized[str_sub(variable, 1, 6) == 'Thy_KO'] <- 'KO')
+thymus.prop.summarized.melt <- within(thymus.prop.summarized.melt, type_normalized[str_sub(variable, 1, 15) == 'Tumor_ALKpos_WT'] <- 'ALK')
+thymus.prop.summarized.melt <- within(thymus.prop.summarized.melt, type_normalized[str_sub(variable, 1, 13) == 'Thy_ALKpos_KO'] <- 'ALKKO')
+
+thymus.prop.summarized.melt$type_normalized <- factor(thymus.prop.summarized.melt$type_normalized, levels= c('Ctrl', 'KO', 'ALK', 'ALKKO'))
+thymus.prop.summarized.melt$cluster_name <- factor(thymus.prop.summarized.melt$cluster_name, levels=  list_pseudotime[1:7])
+
+#all samples/replicas
+p <- ggplot(thymus.prop.summarized.melt[thymus.prop.summarized.melt$type_normalized %in% c('Ctrl', 'KO', 'ALK', 'ALKKO') & thymus.prop.summarized.melt$cluster_name %in% list_pseudotime,], aes(x=cluster_name, y=value, color=type_normalized)) +
+  geom_point(size=6, shape=20) +
+  labs(title=NULL,x="Cell Type", y = "Proportion") + theme_linedraw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        axis.text=element_text(size=16),
+        axis.title=element_text(size=18,face="bold"), 
+        plot.title = element_text(size = 18, face = "italic"),
+        legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16)) + 
+  ylim(0, 1.0)
+p +  scale_color_manual(name = "Sample", breaks = c('Ctrl', 'KO', 'ALK', 'ALKKO'), values = c("#006400", "#104E8B", "#CD0000", "#8B4789")) + theme_light()
+
+#ALK replicas
+p <- ggplot(thymus.prop.summarized.melt[thymus.prop.summarized.melt$type_normalized %in% c('Ctrl', 'ALK') & thymus.prop.summarized.melt$cluster_name %in% list_pseudotime,], aes(x=cluster_name, y=value, color=type_normalized)) +
+  geom_point(size=6, shape=20) +
+  labs(title=NULL,x="Cell Type", y = "Proportion") + theme_linedraw() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        axis.text=element_text(size=16),
+        axis.title=element_text(size=18,face="bold"), 
+        plot.title = element_text(size = 18, face = "italic"),
+        legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16)) + 
+  ylim(0, 1.0)
+ 
+p +  scale_color_manual(name = "Sample", breaks = c('Ctrl', 'KO', 'ALK', 'ALKKO'), values = c("#136c38", "#1f5a8b", "#c5282a", "#92578a")) + theme_light()
+```
+
+Comparison between the actual proportions of the single-cell data and the estimated proportions of the bulk thymus data, specifically with the Ctrl sample.
+```{r plot_comparison_ctrl_proportion}
+#Calculate the proportion for clusters where 13,16,22 and 23 don't have cells, that means 20 clusters.
+real_proportion <- calculate_proportions_4w_8w_24w(eset.sc.thymus.4.sparse.metacluster, 29)
+real_proportion.pseudotime <- real_proportion[, c(8,9,10,11,28,4,3)]
+
+real_proportion.pseudotime.rescaled <- NULL
+for(counter in 1:nrow(real_proportion.pseudotime)){
+  new_row <- real_proportion.pseudotime[counter,]/sum(real_proportion.pseudotime[counter,])
+  real_proportion.pseudotime.rescaled <- rbind(real_proportion.pseudotime.rescaled, new_row)
+}
+
+colnames(real_proportion.pseudotime.rescaled) <- list_pseudotime
+
+comparison_real_vs_deconvolution <- rbind(results_summarized[1:12,], real_proportion.pseudotime.rescaled)
+
+
+thymus.proportions.summarized <- as.data.frame(t(comparison_real_vs_deconvolution[]))
+
+thymus.proportions.summarized <- cbind(thymus.proportions.summarized, cluster_name = rownames(thymus.proportions.summarized))
+
+
+thymus.proportions.summarized.melt <- melt(thymus.proportions.summarized, id.vars='cluster_name')
+thymus.proportions.summarized.melt <- cbind(thymus.proportions.summarized.melt, type = '', type_normalized = '', stringsAsFactors=FALSE)
+
+thymus.proportions.summarized.melt$cluster_name <- factor(thymus.proportions.summarized.melt$cluster_name, levels = list_pseudotime)
+
+thymus.proportions.summarized.melt <- within(thymus.proportions.summarized.melt, type_normalized[str_sub(variable, 1, 6) == 'Thy_WT'] <- 'Ctrl')
+thymus.proportions.summarized.melt <- within(thymus.proportions.summarized.melt, type_normalized[str_sub(variable, 1, 6) == 'Thy_KO'] <- 'KO')
+thymus.proportions.summarized.melt <- within(thymus.proportions.summarized.melt, type_normalized[str_sub(variable, 1, 15) == 'Tumor_ALKpos_WT'] <- 'ALK')
+thymus.proportions.summarized.melt <- within(thymus.proportions.summarized.melt, type_normalized[str_sub(variable, 1, 13) == 'Thy_ALKpos_KO'] <- 'ALKKO')
+thymus.proportions.summarized.melt <- within(thymus.proportions.summarized.melt, type_normalized[str_sub(variable, 1, 13) == '4w_thymus'] <- '4w_thymus')
+thymus.proportions.summarized.melt <- within(thymus.proportions.summarized.melt, type_normalized[str_sub(variable, 1, 13) == '8w_thymus'] <- '8w_thymus')
+thymus.proportions.summarized.melt <- within(thymus.proportions.summarized.melt, type_normalized[str_sub(variable, 1, 13) == '24w_thymus'] <- '24w_thymus')
+
+thymus.proportions.summarized.melt$type_normalized <- factor(thymus.proportions.summarized.melt$type_normalized, levels= c('Ctrl', 'KO', 'ALK', 'ALKKO', '4w_thymus', '8w_thymus', '24w_thymus'))
+
+#real proportion vs control
+thymus.proportions.deconvolution.summarized.melt <- rbind(thymus.proportions.summarized.melt)
+
+p <- ggplot(thymus.proportions.deconvolution.summarized.melt[thymus.proportions.deconvolution.summarized.melt$type_normalized %in% c('4w_thymus','8w_thymus', '24w_thymus', 'Ctrl') & thymus.proportions.deconvolution.summarized.melt$cluster_name %in% list_pseudotime,], aes(x=cluster_name, y=value, color=type_normalized)) +
+  geom_point(size=6, shape=20) +
+  labs(title=NULL,x="Cell Type", y = "Proportion") + theme_linedraw() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        axis.text=element_text(size=16),
+        legend.title = element_text(size = 16),
+          legend.text = element_text(size = 16)) + 
+  ylim(0, 1.0)
+ 
+p +  scale_color_manual(name = "Sample", breaks = c('4w_thymus', '8w_thymus', '24w_thymus', 'Ctrl'), values = c("turquoise3", "bisque2", "darkgrey", "#136c38")) + theme_light()
+```
+
+Concordance between each replica in the bulk data and the single-cell data in different time points using the marker genes selected in the deconvolution. Each value corresponding to the correlation between the time points and the replicas.
+```{r plot_concordance}
+#for each sample"4W"  "8W"  "24W" "E14" "E16" "P0"  "E18" "E12" "E13" "E15" "E17" I have to change the reference
+marker.list.plot <- as.character(markers.deconvolution.real_data)
+
+verbose <- FALSE
+
+concordance.all.time.points.df <- NULL
+colnames_time_points <- colnames(pseudo.eset.sc.thymus.4.sparse.all$pseudo_eset@assayData$exprs)
+for(counter_time_point in 1:length(colnames_time_points)){
+  colnames_samples <- colnames(eset.thymus.bulk.sparse@assayData$exprs)
+  for(counter in 1:length(colnames_samples)){
+    time_point <- colnames_time_points[counter_time_point]
+    result <- cor(pseudo.eset.sc.thymus.4.sparse.all$pseudo_eset@assayData$exprs[marker.list.plot,time_point], eset.thymus.bulk.sparse@assayData$exprs[marker.list.plot,counter])
+    
+    #show information for each calculation
+    if(verbose)
+      print(paste0(time_point, '-',colnames_samples[counter], ':', result))
+    
+    concordance.all.time.points.df <- rbind(concordance.all.time.points.df, c(time_point,colnames_samples[counter], result))
+  }
+}
+
+concordance.all.time.points.df <- data.frame(time_point = concordance.all.time.points.df[,1], sample=concordance.all.time.points.df[,2], value = as.numeric(concordance.all.time.points.df[,3]), sample_normalized = '')
+
+age_levels <- c('E12', 'E13', 'E14', 'E15','E16', 'E17', 'E18', 'P0', "4W", "8W", "24W")
+sample_levels <- c('Thy_WT_1', 'Thy_WT_2', 'Thy_WT_3',
+                   "Thy_KO_1", "Thy_KO_2", "Thy_KO_3",
+                   'Tumor_ALKpos_WT_1', 'Tumor_ALKpos_WT_2', 'Tumor_ALKpos_WT_3', 
+                   "Thy_ALKpos_KO_1", "Thy_ALKpos_KO_2","Thy_ALKpos_KO_3")
+
+sample_levels_normalized <- c('Ctrl 1', 'Ctrl 2', 'Ctrl 3',
+                   "KO 1", "KO 2", "KO 3",
+                   'ALK 1', 'ALK 2', 'ALK 3', 
+                   "ALK-KO 1", "ALK-KO 2","ALK-KO 3")
+
+concordance.all.time.points.df$sample_normalized <- factor(concordance.all.time.points.df$sample_normalized, levels = sample_levels_normalized)
+
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_WT_1'] <- 'Ctrl 1')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_WT_2'] <- 'Ctrl 2')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_WT_3'] <- 'Ctrl 3')
+
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_KO_1'] <- 'KO 1')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_KO_2'] <- 'KO 2')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_KO_3'] <- 'KO 3')
+
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Tumor_ALKpos_WT_1'] <- 'ALK 1')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Tumor_ALKpos_WT_2'] <- 'ALK 2')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Tumor_ALKpos_WT_3'] <- 'ALK 3')
+
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_ALKpos_KO_1'] <- 'ALK-KO 1')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_ALKpos_KO_2'] <- 'ALK-KO 2')
+concordance.all.time.points.df <- within(concordance.all.time.points.df, sample_normalized[sample == 'Thy_ALKpos_KO_3'] <- 'ALK-KO 3')
+
+
+concordance.all.time.points.df$time_point <- factor(concordance.all.time.points.df$time_point, levels= age_levels)
+concordance.all.time.points.df$sample <- factor(concordance.all.time.points.df$sample, levels = sample_levels)
+
+#plot of concordance for each time point and replica
+p <- ggplot(concordance.all.time.points.df,  aes(time_point, sample_normalized, fill= value)) + 
+  scale_fill_gradientn(colours = c("#2166AC", "#4393C3", "#D1E5F0", "#ffffff", "#fddf92", "#f89f61", "#ef6242", "#af1d31"), na.value = 'gray88', limits=c(-0.15, .75)) +
+  geom_tile() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title=NULL,x="", y = "", fill = "log2(fold-change)") 
+p + geom_text(aes(label=round(value,2)), size=2)
+
+```
+
+# Bulk RNA-seq simulation and differential expression analysis {.tabset}
+
+Due to the heterogeneity of the ALK tumor sample, we constructed a simulation of bulk data samples based on the sc-RNA-seq data applying the proportions estimated by the deconvolution for each replica and only taking into account the 7 cell types used in the deconvolution for ages 4, 8 and 24 weeks. We wanted to see if there were highly expressed genes in the bulk ALK tumor sample that can not be well explained by the simulated mixture, therefore these shouldn't be marker genes.
+```{r creation_bulk_simulation}
+
+#I got for each cell type the actual summary for each gene. I have some doubts about the counting coherence with the original bulk data
+pseudotime.celltypes <- c(paste0('cluster_', c(8,9,10,11,28,4,3)))
+
+#filtered bulk data
+bulk.data.count <- eset.thymus.bulk.sparse@assayData$exprs
+bulk.data.count <- bulk.data.count[rowSums(bulk.data.count[,]) >0,] 
+
+#filtered single cell data
+sc.data.count <- seurat_object.4w_8w_24w@assays$RNA@counts
+sc.data.count <- sc.data.count[rowSums(sc.data.count[,]) >0,] 
+
+#calculate the genes shared between the bulk and single cell data.
+shared.genes.bulk.single_cell <- Reduce(intersect, list(rownames(sc.data.count), rownames(bulk.data.count)))
+print(paste0("Shared between the bulk and single cell data: ",length(shared.genes.bulk.single_cell)))
+
+#filtering the single cell data with the shared genes and only for the cell types of interest (7 T-Cell)
+celltype.counting.pseudotime.all <- sc.data.count[shared.genes.bulk.single_cell, seurat_object.4w_8w_24w$cluster_normalized %in% pseudotime.celltypes]
+
+#Check the relative percentage of the 7 T-Cell types with respecto to the whole sc-RNA-seq dataset
+pseudotime.sum <- sum(celltype.counting.pseudotime.all)
+all.sum <- sum(sc.data.count[shared.genes.bulk.single_cell,])
+percentage <- pseudotime.sum/all.sum
+#0.9336861 (3 Time points)
+print(paste0("Relative percentage: ", round(percentage,4)*100))
+
+#Calculate the summarized object based on the single cell data
+pseudotime.summary.by.celltype <- create_summary_single_cell(pseudotime.celltypes, shared.genes.bulk.single_cell, seurat_object.4w_8w_24w, sc.data.count)
+
+#I got the proportions from the deconvolution
+print("Proportions calculated for the deconvolution: ")
+deconvolution.real_data$prop.est
+
+#Applying proportions to the complete set of replicas and samples in the original bulk thymus data.
+bulk.simulated.thymus.pseudotime <- apply_proportions_complete_single_cell_dataset(bulk.data.count, deconvolution.real_data, pseudotime.summary.by.celltype)
+
+#getting the final bulk data. I build the bulk data for the analysis.
+print("Bulk data simulated:")
+head(bulk.simulated.thymus.pseudotime)
+
+```
+
+Downloading of the library: [GTFtools](https://www.biorxiv.org/content/10.1101/263517v1.full) from [GTFtools version:0.6.9](http://www.genemine.org/gtftools.php) and the corresponding gencode annotation file to calculate the size of the genes. The pre-requisites for the gene size calculation are: Linux system (Ubuntu or Debian based), python 2 and the GTFtools installed. We need the gene size in order to calculate the TPM normalization for the bulk data.
+```{bash calculate_gene_size, eval = FALSE}
+#Install the tool version:0.6.9  -> http://www.genemine.org/gtftools.php
+mkdir temporal
+cd temporal
+wget http://www.genemine.org/codes/GTFtools_0.6.9.zip
+unzip GTFtools_0.6.9.zip
+
+#download the gencode annotation file that coincides with the alignment that we use for creating the counting files. Use the webpage: https://www.gencodegenes.org/mouse/release_M25.html
+wget ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M24/gencode.vM24.annotation.gtf.gz
+gunzip gencode.vM24.annotation.gtf.gz
+
+#I got 55349
+python2 GTFtools_0.6.9/gtftools.py -l gene_length.gencode.vM24.annotation.bed gencode.vM24.annotation.gtf 
+
+#genes and gene.id: I got 55385
+awk '{print $9$10 $15$16}' gencode.vM24.annotation.gtf > gene.id.name.txt
+uniq gene.id.name.txt > gene.id.name.unique.txt
+grep -nr "gene_name" gene.id.name.unique.txt > gene.id.name.unique.2.txt
+
+```
+
+Generation of the summary with different kind of size calculation for each gene.
+```{r summarizing_gene_size}
+path <-  paste0(getwd(), '/', 'temporal/')
+gene.file.name <- 'gene.id.name.unique.2.txt'
+gene_length.file.name <- 'gene_length.gencode.vM24.annotation.bed'
+
+##########################gene.id vs gene.name
+gene.file <- read.csv(paste0(path, gene.file.name), header = FALSE, sep = ";")
+gene.file <- gene.file[,1:2]
+
+#get just the gene.id
+gene.ids.list <- lapply(gene.file[,1], function (x) substr(x, unlist(str_locate(x, 'ENSMUS'))[1], nchar(as.character(x))))
+
+#I got 50600 unique gene.id and 50508 unique gene names
+gene.file.df <- data.frame(gene= unlist(gene.ids.list), 
+                           gene.name = str_remove_all(gene.file[,2], 'gene_name'))
+
+
+##########################genes' length
+gene_length.file.df <- read.csv(paste0(path, gene_length.file.name), header = TRUE, sep = "\t")
+
+#################JOIN of the length and the names
+genes.plus.length <- gene_length.file.df %>% inner_join(gene.file.df)
+print("")
+print(paste0("Genes with length and name: ", length(genes.plus.length$gene.name))) 
+print(paste0("Unique genes: ", unique(length(genes.plus.length$gene.name))))
+```
+
+Normalization of the bulk data using [TPM strategy](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6923842/).
+```{r calculate_TPM}
+#calculate the shared genes between bulk data and df with genes' lenght
+bulk.data.count <- eset.thymus.bulk.sparse@assayData$exprs
+
+#46816 genes from 50532 in the bulk data
+shared.genes <-  Reduce(intersect, list(genes.plus.length$gene.name, rownames(bulk.data.count)))
+length(unique(shared.genes))
+
+#new bulk data with the genes that have lenght information 
+bulk.data.count.filtered <- bulk.data.count[rownames(bulk.data.count) %in% shared.genes,]
+genes.plus.length.filtered <- genes.plus.length[genes.plus.length$gene.name %in% shared.genes, ]
+
+length.genes.list <- genes.plus.length.filtered$merged
+names(length.genes.list) <- genes.plus.length.filtered$gene.name
+
+#I order by the shared genes vector and calculate the tpm count
+bulk.data.count.TPM <- r_tpm(bulk.data.count.filtered[shared.genes,], length.genes.list[shared.genes])
+```
+
+We choose the top 10% of the most highly expressed genes in the original bulk data using TPM normalization
+```{r top_10_percentage_filter}
+#I added the marker genes at the begining
+selected.genes.TPM <- markers.deconvolution.real_data
+for(counter in 1:ncol(bulk.data.count.TPM) ){
+  sample <- bulk.data.count.TPM[,counter]
+  sample <- sort(sample)
+  size <- as.integer(length(sample)*.10)
+  top.10.percentage <- tail(sample, size)
+  selected.genes.TPM <- c(selected.genes.TPM, names(top.10.percentage))
+  selected.genes.TPM <- unique(selected.genes.TPM)
+}
+
+#7550 without marker genes
+print(paste0('Genes in the Top 10% + marker genes: ', length(selected.genes.TPM)))
+```
+
+Differential expression analysis using DESeq2 between the set of replicas for each sample and the corresponding replicas in the simulation
+```{r differential_analysis}
+#Create the bulk dataset for each comparison (all simulated samples vs specific sample)
+bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_WT <- cbind(bulk.simulated.thymus.pseudotime, bulk.data.count[rownames(bulk.simulated.thymus.pseudotime), c(7,8,9)])
+bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_KO <- cbind(bulk.simulated.thymus.pseudotime, bulk.data.count[rownames(bulk.simulated.thymus.pseudotime), c(4,5,6)])
+bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_ALKpos_WT <- cbind(bulk.simulated.thymus.pseudotime, bulk.data.count[rownames(bulk.simulated.thymus.pseudotime), c(10,11,12)])
+bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_ALKpos_KO <- cbind(bulk.simulated.thymus.pseudotime, bulk.data.count[rownames(bulk.simulated.thymus.pseudotime), c(1,2,3)])
+
+#calculate each differential analyisis in each experiment:
+RES.thymus.lfc.Thy_WT <- create_differential_expression_set('Thy_WT', selected.genes.TPM, bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_WT)
+RES.thymus.lfc.Thy_KO <- create_differential_expression_set('Thy_KO', selected.genes.TPM, bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_KO)
+RES.thymus.lfc.Thy_ALKpos_WT <- create_differential_expression_set('Thy_ALKpos_WT', selected.genes.TPM, bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_ALKpos_WT)
+RES.thymus.lfc.Thy_ALKpos_KO <- create_differential_expression_set('Thy_ALKpos_KO', selected.genes.TPM, bulk.simulated.thymus.pseudotime.plus.actual.tumor.Thy_ALKpos_KO)
+```
+
+Heatmap with the log2(fold-change) values of the real vs simulated samples for the marker genes selected in the deconvolution.
+```{r heatmap_marker_genes, fig.width=6, fig.height=12}
+
+shared.genes.foldchange <- Reduce(intersect, list(rownames(RES.thymus.lfc.Thy_WT$treatment_simu_Thy_WT_vs_Thy_WT[,]),
+                                                  rownames(RES.thymus.lfc.Thy_KO$treatment_simu_Thy_KO_vs_Thy_KO[,]), 
+                                                  rownames(RES.thymus.lfc.Thy_ALKpos_WT$treatment_simu_Thy_ALKpos_WT_vs_Thy_ALKpos_WT[,]),
+                                                  rownames(RES.thymus.lfc.Thy_ALKpos_KO$treatment_simu_Thy_ALKpos_KO_vs_Thy_ALKpos_KO[,])))
+
+treatment_simu_Thy_WT_vs_Thy_WT <- RES.thymus.lfc.Thy_WT$treatment_simu_Thy_WT_vs_Thy_WT[shared.genes.foldchange, ]
+treatment_simu_Thy_ALKpos_WT_vs_Thy_ALKpos_WT <- RES.thymus.lfc.Thy_ALKpos_WT$treatment_simu_Thy_ALKpos_WT_vs_Thy_ALKpos_WT[shared.genes.foldchange, ]
+treatment_simu_Thy_KO_vs_Thy_KO <- RES.thymus.lfc.Thy_KO$treatment_simu_Thy_KO_vs_Thy_KO[shared.genes.foldchange, ]
+treatment_simu_Thy_ALKpos_KO_vs_Thy_ALKpos_KO <- RES.thymus.lfc.Thy_ALKpos_KO$treatment_simu_Thy_ALKpos_KO_vs_Thy_ALKpos_KO[shared.genes.foldchange, ]
+
+#Creation of the dataframe with simulation vs the actual sample (Original differential expression analyisis)
+dataset.heatmap.0 <- data.frame(treatment_simu_Thy_WT_vs_Thy_WT = treatment_simu_Thy_WT_vs_Thy_WT$log2FoldChange,
+                                treatment_simu_Thy_ALKpos_WT_vs_Thy_ALKpos_WT = treatment_simu_Thy_ALKpos_WT_vs_Thy_ALKpos_WT$log2FoldChange,
+                                treatment_simu_Thy_KO_vs_Thy_KO = treatment_simu_Thy_KO_vs_Thy_KO$log2FoldChange,
+                                treatment_simu_Thy_ALKpos_KO_vs_Thy_ALKpos_KO = treatment_simu_Thy_ALKpos_KO_vs_Thy_ALKpos_KO$log2FoldChange,                               
+                                gene = shared.genes.foldchange)
+
+#Creation of the dataframe with the actual sample vs simulation (multiplying -1)
+dataset.heatmap.1 <- data.frame('Thy_WT_vs_simu_Thy_WT' = treatment_simu_Thy_WT_vs_Thy_WT$log2FoldChange * -1,
+                                'Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT' = treatment_simu_Thy_ALKpos_WT_vs_Thy_ALKpos_WT$log2FoldChange * -1,
+                                'Thy_KO_vs_simu_Thy_KO' = treatment_simu_Thy_KO_vs_Thy_KO$log2FoldChange * -1,
+                                'Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO' = treatment_simu_Thy_ALKpos_KO_vs_Thy_ALKpos_KO$log2FoldChange * -1,                               
+                                gene = shared.genes.foldchange)
+
+#sorting for foldchange in the thymus WT
+dataset.heatmap.1 <- dataset.heatmap.1[ order(dataset.heatmap.1$Thy_WT_vs_simu_Thy_WT), ]
+
+data <- melt(dataset.heatmap.1[,], id.vars='gene')
+data$value <- as.numeric(data$value)
+colnames(data) <- c('genes', 'comparison', 'value')
+
+#order
+data$gene <- factor(data$genes, levels = dataset.heatmap.1$gene)
+
+data <- data.frame(data, comparison_normalized = '')
+data$comparison_normalized <- factor(data$comparison_normalized, levels = c('Ctrl vs simulation Ctrl',
+                                                      'KO vs simulation KO',
+                                                      'ALK vs simulation ALK',
+                                                      'ALK-KO vs simulation ALK-KO'))
+
+data$comparison <- factor(data$comparison, levels = c('Thy_WT_vs_simu_Thy_WT',
+                                                      'Thy_KO_vs_simu_Thy_KO',
+                                                      'Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT',
+                                                      'Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO'))
+
+data <- within(data, comparison_normalized[comparison == 'Thy_WT_vs_simu_Thy_WT'] <- 'Ctrl vs simulation Ctrl')
+data <- within(data, comparison_normalized[comparison == 'Thy_KO_vs_simu_Thy_KO'] <- 'KO vs simulation KO')
+data <- within(data, comparison_normalized[comparison == 'Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT'] <- 'ALK vs simulation ALK')
+data <- within(data, comparison_normalized[comparison == 'Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO'] <- 'ALK-KO vs simulation ALK-KO')
+
+#plot of marker genes
+ggplot(data[data$gene %in% markers.deconvolution.real_data,], aes(x=comparison_normalized, y=gene , fill= value)) + 
+  geom_tile() +
+theme(axis.text.x = element_text(angle = 45, hjust = 1)
+      ,axis.text.y = element_blank()
+      ,axis.ticks.y = element_blank()
+      ) +
+   scale_fill_gradientn(colours = c("#2166AC", "#4393C3", "#D1E5F0", "#ffffff", "#fddf92", "#f89f61", "#ef6242", "#af1d31"), na.value = 'gray88', limits=c(-12, 12)) +
+  labs(y= element_blank(), x = element_blank(), fill = "log2(fold-change)")
+
+```
+
+List of both up and down regulated genes, having as a reference the tumor sample analysis. We use a limit in log2(fold-change) of (3, -3) considering the others analysis with values in (-1, 1)
+```{r up_down_regulation}
+threshold.log2foldchange.up <- 3
+threshold.log2foldchange.down <- -3
+
+#We filter the marker genes
+upregulated.tumor <- dataset.heatmap.1[ !(dataset.heatmap.1$gene %in% markers.deconvolution.real_data) &
+                                        ((dataset.heatmap.1$Thy_WT_vs_simu_Thy_WT < dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT & 
+                                          dataset.heatmap.1$Thy_WT_vs_simu_Thy_WT < 1 &
+                                          dataset.heatmap.1$Thy_WT_vs_simu_Thy_WT > -1 &
+                                          dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT > threshold.log2foldchange.up) | 
+                                         
+                                         (dataset.heatmap.1$Thy_KO_vs_simu_Thy_KO < dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT & 
+                                          dataset.heatmap.1$Thy_KO_vs_simu_Thy_KO < 1 &
+                                          dataset.heatmap.1$Thy_KO_vs_simu_Thy_KO > -1 &
+                                          dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT > threshold.log2foldchange.up) |
+                                         
+                                         (dataset.heatmap.1$Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO < dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT & 
+                                          dataset.heatmap.1$Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO < 1 &
+                                          dataset.heatmap.1$Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO > -1 &
+                                          dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT > threshold.log2foldchange.up)), ]
+
+print(paste0("Up-regulated genes: ", nrow(upregulated.tumor)))
+
+#We filter the marker genes
+downregulated.tumor <- dataset.heatmap.1[!(dataset.heatmap.1$gene %in% markers.deconvolution.real_data) &
+                                          ((dataset.heatmap.1$Thy_WT_vs_simu_Thy_WT > -1 &
+                                            dataset.heatmap.1$Thy_WT_vs_simu_Thy_WT < 1 &
+                                            dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT < threshold.log2foldchange.down) |
+                                           
+                                           (dataset.heatmap.1$Thy_KO_vs_simu_Thy_KO > -1 &
+                                            dataset.heatmap.1$Thy_KO_vs_simu_Thy_KO < 1 &
+                                            dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT < threshold.log2foldchange.down) |
+                                           
+                                           (dataset.heatmap.1$Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO > -1 &
+                                            dataset.heatmap.1$Thy_ALKpos_KO_vs_simu_Thy_ALKpos_KO < 1 &
+                                            dataset.heatmap.1$Thy_ALKpos_WT_vs_simul_Thy_ALKpos_WT < threshold.log2foldchange.down)), ]
+
+
+print(paste0("Down-regulated genes: ", nrow(downregulated.tumor)))
+```
+
+Given the fact that the markers genes can change in about 5% because of the boosting sampling process in the deconvolution, the proportion estimation for each replica could also slightly change generating some variations in the simulated bulk data. We tested different executions and we found that in the worst case the variation of the up-regulated and down-regulated genes is up to 20% with the static threshold.log2foldchange.up of (-3, 3). The rest of the genes, generally could be found by decreasing the range of the query: threshold.log2foldchange = [-2.5, 2.5] for instance.
+```{r verification_replicability}
+print(paste0("Current marker genes: ", length(markers.deconvolution.real_data)))
+
+#Data in the publication
+marker.genes.tumor.check <- c('H19',	'Igfbp4',	'Notch1',	'Tyrobp',	'Mki67',	'Top2a',	'Adgrg5',	'Spns2',	'Bst1',	'Kit',	'Gimap4',	'Galnt6',	'Notch3',	'Kif11',	'Fam102a',	'Ccna2',	'Bub1b',	'Racgap1',	'Plekha7',	'S1pr1',	'Tpx2',	'Acvrl1',	'Vim',	'Aurkb',	'Tacc3',	'Cdk1',	'Nusap1',	'Kif15',	'Cenpf',	'Tesc',	'Rrm2',	'Cdca3',	'H2-K1',	'Pbk',	'Prc1',	'Dntt',	'Evl',	'Cenpe',	'Xrcc6',	'Chd3',	'Cdk6',	'Il7r',	'Ccnb2',	'Rcsd1',	'Hmmr',	'Cdc20',	'Tshz2',	'Tifa',	'Actb',	'Atp8b4',	'Lfng',	'Mpzl2',	'Cdca8',	'Esco2',	'Ube2c',	'Birc5',	'Spc25',	'Ccr7',	'Zbtb7b',	'Cd2',	'Asf1b',	'Tyms',	'Tcf12',	'Myb',	'Fbxo5',	'Mxd3',	'Ogt',	'Itgb7',	'Samhd1',	'Hdac4',	'Ccnb1',	'Endou',	'Gprin3',	'Rplp1',	'Ifitm1',	'Hhex',	'Arpp21',	'Spc24',	'Rmnd5a',	'Ctsw',	'Ctsl',	'Pfn1',	'Il2ra',	'Itgae',	'Paqr5',	'Trp53inp1',	'Tmsb4x',	'Tnfrsf4',	'Tuba1b',	'Hes1',	'Dck',	'Pld4',	'Epcam',	'Cyb5a',	'Tmem121',	'Satb1',	'Zeb2',	'Ccl5',	'Aqp11',	'Cdkn1a',	'Klrd1',	'1500009L16Rik',	'Cd27',	'Nkg7',	'Inpp4b',	'Rpl32',	'Adamts17',	'Ets2',	'Klf13',	'Cd53',	'Themis',	'Klk8',	'Bach2',	'Ldhb',	'Tox',	'Itm2a',	'Shisa5',	'Gria3',	'Tespa1',	'Hmgb2',	'Mxd4',	'Bcl2',	'Cd28',	'Smad7',	'Prss57',	'Actn2',	'Ctla2a',	'Mier1',	'Gtf2h4',	'Cd8a',	'Arl5c',	'Ifi27l2a',	'Ikzf2',	'Izumo1r',	'Cd7',	'Gimap3',	'Ckb',	'Cd4',	'Ypel3',	'Smim5',	'Ssbp2',	'Plac8',	'Cks2',	'Ccnd2',	'Bpifc',	'Klf2',	'Nsg2',	'Tmsb10',	'Arap2',	'Cd226',	'Rab44',	'Pacsin1',	'Mpo',	'Slfn1',	'Sstr2',	'Ms4a4b',	'Dnajc15',	'Socs1',	'Ccr9',	'Nebl',	'Scin',	'Cpa3',	'Chrna9',	'Cd8b1',	'Fgf3',	'Myl10',	'Cd40lg',	'Slc7a11',	'Cd5',	'Khdc1a',	'Tctex1d1',	'Actg1',	'Dgkeos',	'Ifitm2',	'Gm5111')
+
+upregulated.tumor.check <- c('Alx4',	'Aqp9',	'Tbx19',	'Lhfpl3',	'Bricd5',	'Fbp1',	'Acox2',	'Tmem150cos',	'Wdr25',	'Hopx',	'Sytl2',	'Amigo2',	'Ceacam1',	'Atp1a3',	'Fam174b',	'Gpx7',	'Elfn2',	'Bmp7',	'Plod2',	'Rgs16',	'Nrarp',	'Rdh10',	'Lonrf1',	'Ano10',	'Etv5',	'Zdhhc2',	'Esm1',	'Col9a3',	'Art2b',	'Mxra7',	'Col27a1',	'Dpp4',	'Cacng4',	'Apbb2',	'Farp2',	'Qsox2',	'Sh2d3c',	'Tmtc4',	'Tnfrsf8',	'Mtmr9',	'Rnf144a',	'Nsg1',	'Tfrc',	'Dtx1',	'Pced1b',	'Camk1g',	'Capg',	'Nwd1',	'Slc22a17')
+
+downregulated.tumor.check <- c('BB031773',	'Fabp3',	'Slc6a19',	'Cd6',	'Lsp1',	'Cd69',	'Pglyrp1',	'Gbp8',	'BC035044',	'Rasgrp1',	'Clec2d',	'Itga4',	'Art1',	'Nr4a1',	'Pth',	'Traf1',	'Il21r',	'Gpr183',	'Eci1',	'Pgam2',	'S1pr4',	'Wdr78',	'Pdcd1',	'Rab19',	'Tdrd5',	'Slfn2',	'AW112010',	'Ifit1bl1',	'Klf4',	'Fbxo27',	'Tbxa2r',	'Dhrs3',	'Apoa2',	'Rasl11b',	'Tec',	'Rrad',	'Gpr162',	'Bin1',	'Isg15')
+
+
+#checking markers genes
+shared_marker.genes.check <- Reduce(intersect, list(marker.genes.tumor.check, markers.deconvolution.real_data))
+print(paste0("Shared marker genes: ", length(shared_marker.genes.check), " -> ", round((length(shared_marker.genes.check)/length(marker.genes.tumor.check)), 2) , "%"))
+
+#checking up-regulated genes
+shared_upregulated.check <- Reduce(intersect, list(upregulated.tumor$gene, upregulated.tumor.check))
+print(paste0("Shared genes up-regulation: ", length(shared_upregulated.check), " -> ", round((length(shared_upregulated.check)/length(upregulated.tumor.check)), 2) , "%"))
+
+#checking down-regulated genes
+shared_downregulated.check <- Reduce(intersect, list(downregulated.tumor$gene, downregulated.tumor.check))
+print(paste0("Shared genes down-regulation: ", length(shared_downregulated.check), " -> ", round((length(shared_downregulated.check)/length(downregulated.tumor.check)), 2) , "%"))
+
+```
+
