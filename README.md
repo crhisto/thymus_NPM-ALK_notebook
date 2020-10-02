@@ -3,7 +3,7 @@
 
 You can find the following files in the repository:
 1. **R Notebook with examples:** [thymus_NPM-ALK_notebook.Rmd](thymus_NPM-ALK_notebook.Rmd)
-2. **Html with with examples:** [thymus_NPM-ALK_notebook.html](thymus_NPM-ALK_notebook.html)
+2. **Html with examples:** [thymus_NPM-ALK_notebook.html](thymus_NPM-ALK_notebook.html)
 2. **Additional R functions:** [generic_functions.R](scripts/generic_functions.R)
 3. **R file with the Bulk data object:** [eset.thymus.bulk.sparse.RData.zip](data/eset.thymus.bulk.sparse.RData.zip)
 
@@ -14,7 +14,7 @@ In order to execute the complete pipeline, at the beginning of the R Notebook th
    - **Repository**: https://github.com/crhisto/SCDC
    - **Modifications**: 
      - Compatibility with sparse matrices using: `dgCMatrix` objects in R.
-     - Rutines with parallelization
+     - Routines with parallelization
      - Dynamic threshold for markers selection
      - Improvements in logs and so on.
    - **Original repository**: https://github.com/meichendong/SCDC
@@ -29,4 +29,4 @@ In order to execute the complete pipeline, at the beginning of the R Notebook th
    - **Modifications**: Compatibility with sparse matrices using: `dgCMatrix` objects in R.
    - **Original repository**: https://github.com/renozao/xbioc
             
-Publication: [Requeriment of DNMT1 to orchestrate epigenomic reprogramming during NPM-ALK driven T-cell lymphomagenesis](https://doi.org/)
+Publication: [Requirement of DNMT1 to orchestrate epigenomic reprogramming during NPM-ALK driven T-cell lymphomagenesis](https://doi.org/)
