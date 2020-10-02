@@ -5,7 +5,7 @@ You can find the following files in the repository:
 1. **R Notebook with examples:** [thymus_NPM-ALK_notebook.Rmd](thymus_NPM-ALK_notebook.Rmd)
 2. **Html with with examples:** [thymus_NPM-ALK_notebook.html](thymus_NPM-ALK_notebook.html)
 2. **Additional R functions:** [generic_functions.R](scripts/generic_functions.R)
-3. **R file with the Bulk data object:** [eset.thymus.bulk.sparse.RData](data/eset.thymus.bulk.sparse.RData)
+3. **R file with the Bulk data object:** [eset.thymus.bulk.sparse.RData.zip](data/eset.thymus.bulk.sparse.RData.zip)
 
 ## Libraries 
 
