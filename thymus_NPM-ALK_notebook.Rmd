@@ -28,7 +28,7 @@ if (!require("devtools")) {
 if("Biobase" %in% rownames(installed.packages())){
   library(Biobase)
 }else{
-  devtools::install_github( repo = "crhisto/Biobase" , auth_token="8fa8c63fdadf5421370f0d0c6217ccff44eebf44")
+  devtools::install_github( repo = "crhisto/Biobase" )
   library(Biobase)
 }
 
@@ -36,7 +36,7 @@ if("Biobase" %in% rownames(installed.packages())){
 if("xbioc" %in% rownames(installed.packages())){
   library(xbioc)
 }else{
-  devtools::install_github( repo = "crhisto/xbioc" , auth_token="8fa8c63fdadf5421370f0d0c6217ccff44eebf44")
+  devtools::install_github( repo = "crhisto/xbioc" )
   library(xbioc)
 }
 
@@ -44,7 +44,7 @@ if("xbioc" %in% rownames(installed.packages())){
 if("SCDC" %in% rownames(installed.packages())){
   library(SCDC)
 }else{
-  devtools::install_github( repo = "crhisto/SCDC" , auth_token="8fa8c63fdadf5421370f0d0c6217ccff44eebf44")
+  devtools::install_github( repo = "crhisto/SCDC" )
   library(SCDC)
 }
 
