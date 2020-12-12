@@ -29,4 +29,4 @@ In order to execute the complete pipeline, at the beginning of the R Notebook th
    - **Modifications**: Compatibility with sparse matrices using: `dgCMatrix` objects in R.
    - **Original repository**: https://github.com/renozao/xbioc
             
-Publication: [Requirement of DNMT1 to orchestrate epigenomic reprogramming during NPM-ALK driven T-cell lymphomagenesis](https://doi.org/)
+Publication: [Requirement of DNMT1 to orchestrate epigenomic reprogramming for NPM-ALK–driven lymphomagenesis](https://www.doi.org/10.26508/lsa.202000794)
